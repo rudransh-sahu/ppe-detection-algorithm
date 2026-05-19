@@ -1,0 +1,28 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environments
+.venv/
+venv/
+env/
+ENV/
+
+# Project Specific - Data & Weights (CRITICAL)
+data/raw/*
+data/processed/*
+models/weights/*
+
+# Keep the folders in git tracking but ignore their contents
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+!models/weights/.gitkeep
+
+# IDEs and editors
+.vscode/
+.idea/
+
+# OS generated files
+.DS_Store
+Thumbs.db
