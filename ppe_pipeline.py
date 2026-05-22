@@ -3,24 +3,23 @@ import numpy as np
 from ultralytics import YOLO
 import os
 import time
-from vlm_async import AsyncVlmAnalyzer
 
 # ------------------------------------------------------------
 # CONFIGURATION
 # ------------------------------------------------------------
 MODEL_PATH = "models/weights/best.onnx"
-VIDEO_PATH = "D:\\Layer 1\\jindal-ppe-detection\\15561206_1920_1080_25fps.mp4"
+VIDEO_PATH = "complete.mp4"
 CONF_THRESH = 0.25
 IMGSZ = 320
 FRAME_SKIP = 1
 PRE_RESIZE = (640, 480)
 ENABLE_TRACKING = True
 ENABLE_VEST_CHECKS = False
-ENABLE_DEEP_ANALYSIS = True
-VLM_ANALYSIS_INTERVAL = 300          # 10 seconds between analyses for same worker
 IOU_THRESH = 0.4
 SHOW_FPS = True
-MIN_BOX_AREA = 5000                  # pixels – ignore very far/small persons
+MIN_BOX_AREA = 5000
+TEMPORAL_VOTE_WINDOW = 5
+TEMPORAL_VOTE_THRESHOLD = 1
 
 # Vest colour ranges (unused if ENABLE_VEST_CHECKS=False)
 GREEN_LOWER = np.array([30, 100, 100])
@@ -34,7 +33,7 @@ MIN_ASPECT_RATIO = 3
 os.environ["OMP_NUM_THREADS"] = "4"
 
 # ------------------------------------------------------------
-# CLEANUP FUNCTION (removes old snapshots on startup)
+# CLEANUP & INIT
 # ------------------------------------------------------------
 def cleanup_old_snapshots(max_keep=100):
     snap_dir = "snapshots"
@@ -50,7 +49,7 @@ def cleanup_old_snapshots(max_keep=100):
         print(f"Cleaned up {deleted} old snapshots, remaining {len(files)}.")
 
 # ------------------------------------------------------------
-# LIGHTWEIGHT IOU TRACKER (same as before)
+# LIGHTWEIGHT IOU TRACKER (ONLY FOR PERSON CLASS)
 # ------------------------------------------------------------
 def iou(box1, box2):
     x1 = max(box1[0], box2[0])
@@ -97,7 +96,7 @@ class LightweightTracker:
         for det in detections:
             found = False
             for tid, tbox, _ in self.tracks:
-                if iou(det, tbox) > 0.5:
+                if iou(det, tbox) > self.iou_thresh:
                     ids.append(tid)
                     found = True
                     break
@@ -106,7 +105,7 @@ class LightweightTracker:
         return ids
 
 # ------------------------------------------------------------
-# VEST CHECKS (optional, keep for completeness)
+# VEST CHECKS (optional)
 # ------------------------------------------------------------
 def check_color_compliance(roi):
     if roi is None or roi.size == 0:
@@ -140,27 +139,43 @@ def has_reflective_stripes(roi):
     return False
 
 # ------------------------------------------------------------
+# TEMPORAL SMOOTHING
+# ------------------------------------------------------------
+class TemporalVote:
+    def __init__(self, window_size=TEMPORAL_VOTE_WINDOW, threshold=TEMPORAL_VOTE_THRESHOLD):
+        self.window = []
+        self.window_size = window_size
+        self.threshold = threshold
+    def add(self, value):
+        self.window.append(value)
+        if len(self.window) > self.window_size:
+            self.window.pop(0)
+    def is_triggered(self):
+        if len(self.window) < self.window_size:
+            return False
+        return sum(self.window) >= self.threshold
+
+# ------------------------------------------------------------
 # MAIN PIPELINE
 # ------------------------------------------------------------
 def main():
+    os.makedirs("snapshots", exist_ok=True)
     cleanup_old_snapshots()
 
     if not os.path.exists(MODEL_PATH):
         print(f"ERROR: Model not found at {MODEL_PATH}")
         return
     model = YOLO(MODEL_PATH)
+    class_names = model.names
+    PERSON_CLASS = "Person"
+    MISSING_PPE_CLASSES = ["no_helmet", "no_goggle", "no_gloves", "no_boots"]
+    VEST_CLASS = "vest"
     print("Loaded YOLO ONNX model.")
-    print(f"Model classes: {model.names}")
-
-    vlm = None
-    worker_last_analyzed = {}
-    if ENABLE_DEEP_ANALYSIS:
-        vlm = AsyncVlmAnalyzer()
-        print("Deep analysis enabled (only when missing PPE).")
+    print(f"Model classes: {class_names}")
 
     cap = cv2.VideoCapture(VIDEO_PATH)
     if not cap.isOpened():
-        print("Cannot open video source.")
+        print(f"Cannot open video source: {VIDEO_PATH}")
         return
 
     tracker = LightweightTracker(iou_thresh=IOU_THRESH) if ENABLE_TRACKING else None
@@ -170,6 +185,14 @@ def main():
     fps_timer = time.time()
     fps_counter = 0
     fps_display = 0
+
+    # Font settings – larger for legibility
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 1.2
+    font_thickness = 3
+
+    # Vote storage for alert
+    worker_vote = {}
 
     while True:
         ret, frame = cap.read()
@@ -188,76 +211,103 @@ def main():
             x_scale = w_orig / w_small
             y_scale = h_orig / h_small
 
-            boxes = []
-            classes = []
-            confs = []
+            person_boxes = []
+            person_confs = []
+            equipment_boxes = []
+            equipment_classes = []
+            all_detections = []
+
             if detections is not None:
                 for box in detections:
                     x1, y1, x2, y2 = map(int, box.xyxy[0])
-                    boxes.append([int(x1*x_scale), int(y1*y_scale), int(x2*x_scale), int(y2*y_scale)])
-                    classes.append(model.names[int(box.cls[0])])
-                    confs.append(float(box.conf[0]))
+                    cls = class_names[int(box.cls[0])]
+                    scaled_box = [int(x1*x_scale), int(y1*y_scale), int(x2*x_scale), int(y2*y_scale)]
+                    conf = float(box.conf[0])
+                    all_detections.append((scaled_box, cls, conf))
+                    if cls == PERSON_CLASS:
+                        person_boxes.append(scaled_box)
+                        person_confs.append(conf)
+                    elif cls in MISSING_PPE_CLASSES:
+                        equipment_boxes.append(scaled_box)
+                        equipment_classes.append(cls)
 
-            if ENABLE_TRACKING and boxes:
-                track_ids = tracker.update(boxes)
+            # Track only persons
+            if ENABLE_TRACKING and person_boxes:
+                track_ids = tracker.update(person_boxes)
             else:
-                track_ids = [None] * len(boxes)
+                track_ids = [None] * len(person_boxes)
 
-            # ----- Build a map of missing PPE per worker -----
+            # Build missing PPE per person via IoU (low threshold)
             missing_ppe_per_worker = {}
-            for i, (cls, tid) in enumerate(zip(classes, track_ids)):
+            for i, pbox in enumerate(person_boxes):
+                tid = track_ids[i] if i < len(track_ids) else None
                 if tid is None:
                     continue
-                if cls in ["no_helmet", "no_vest"]:
-                    missing_ppe_per_worker.setdefault(tid, []).append(cls)
+                for ebox, ecls in zip(equipment_boxes, equipment_classes):
+                    if iou(pbox, ebox) > 0.15:
+                        missing_ppe_per_worker.setdefault(tid, []).append(ecls)
 
-            # ----- Annotate and trigger VLM only for persons with missing PPE -----
+            # Update temporal votes
+            for tid in set(track_ids):
+                if tid is None:
+                    continue
+                if tid not in worker_vote:
+                    worker_vote[tid] = TemporalVote()
+                has_missing = 1 if tid in missing_ppe_per_worker else 0
+                worker_vote[tid].add(has_missing)
+
+            # Draw all detections
             annotated = frame.copy()
-            for i, (box, cls, conf, tid) in enumerate(zip(boxes, classes, confs, track_ids)):
+            for box, cls, conf in all_detections:
                 x1, y1, x2, y2 = box
-                color = (0, 255, 0) if cls == "vest" else (0, 255, 255)
+                if cls == VEST_CLASS:
+                    color = (0, 255, 0)
+                elif cls in MISSING_PPE_CLASSES:
+                    color = (0, 0, 255)
+                else:
+                    color = (0, 255, 255)
                 cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
-                label = f"{f'ID:{tid} ' if tid else ''}{cls}: {conf:.2f}"
-                cv2.putText(annotated, label, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                label = f"{cls}: {conf:.2f}"
+                (tw, th), baseline = cv2.getTextSize(label, font, 0.7, 2)
+                text_x = x1
+                text_y = y1 - 5
+                if text_y - th < 0:
+                    text_y = y1 + th + 5
+                cv2.rectangle(annotated, (text_x, text_y - th - baseline), (text_x + tw, text_y + baseline), (0,0,0), -1)
+                cv2.putText(annotated, label, (text_x, text_y), font, 0.7, (255,255,255), 2)
 
-                if ENABLE_VEST_CHECKS and cls == "vest":
-                    roi = frame[y1:y2, x1:x2]
-                    if roi.size > 0:
-                        roi_small = cv2.resize(roi, (0,0), fx=0.5, fy=0.5)
-                        compliant, col_name = check_color_compliance(roi_small)
-                        stripes = has_reflective_stripes(roi_small)
-                        info = f"Color:{col_name} Stripes:{stripes}"
-                        cv2.putText(annotated, info, (x1, y2+15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
+            # Alert: thick red box + "MISSING HELMET"
+            for i, pbox in enumerate(person_boxes):
+                tid = track_ids[i] if i < len(track_ids) else None
+                if tid is None:
+                    continue
+                if tid in worker_vote and worker_vote[tid].is_triggered():
+                    x1, y1, x2, y2 = pbox
+                    cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 0, 255), 5)
+                    alert_text = "MISSING HELMET"
+                    (tw, th), baseline = cv2.getTextSize(alert_text, font, 1.2, 3)
+                    text_x = x1
+                    text_y = y1 - 10
+                    if text_y - th < 0:
+                        text_y = y1 + th + 10
+                    cv2.rectangle(annotated, (text_x, text_y - th - baseline), (text_x + tw, text_y + baseline), (0,0,255), -1)
+                    cv2.putText(annotated, alert_text, (text_x, text_y), font, 1.2, (255,255,255), 3)
 
-                # ----- VLM trigger: only person, with missing PPE, and box area > threshold -----
-                if vlm and cls == "person" and tid is not None:
-                    box_area = (x2 - x1) * (y2 - y1)
-                    if box_area < MIN_BOX_AREA:
-                        continue   # too far / too small
-                    if tid in missing_ppe_per_worker:   # has missing PPE
-                        cur_frame = frame_count
-                        last = worker_last_analyzed.get(tid, 0)
-                        if cur_frame - last >= VLM_ANALYSIS_INTERVAL:
-                            worker_last_analyzed[tid] = cur_frame
-                            # Ensure valid ROI
-                            y1 = max(0, min(y1, frame.shape[0]-1))
-                            y2 = max(y1+1, min(y2, frame.shape[0]))
-                            x1 = max(0, min(x1, frame.shape[1]-1))
-                            x2 = max(x1+1, min(x2, frame.shape[1]))
-                            if y2 > y1 and x2 > x1:
-                                os.makedirs("snapshots", exist_ok=True)
-                                snap_path = f"snapshots/worker_{tid}_{cur_frame}.jpg"
-                                success = cv2.imwrite(snap_path, frame[y1:y2, x1:x2])
-                                print(f"Snapshot saved: {snap_path} -> success={success}")
-                                if success:
-                                    vlm.analyze_async(snap_path, tid)
-                            else:
-                                print(f"Invalid ROI for worker {tid}: {x1},{y1},{x2},{y2}")
+            # Draw track IDs
+            for i, pbox in enumerate(person_boxes):
+                tid = track_ids[i] if i < len(track_ids) else None
+                if tid is not None:
+                    x1, y1, x2, y2 = pbox
+                    id_text = f"ID:{tid}"
+                    (tw, th), baseline = cv2.getTextSize(id_text, font, 0.8, 2)
+                    cv2.rectangle(annotated, (x1, y1-25), (x1+tw, y1-5), (0,0,0), -1)
+                    cv2.putText(annotated, id_text, (x1, y1-10), font, 0.8, (255,255,0), 2)
 
-            last_annotated = annotated
+            last_annotated = annotated.copy()
             fps_counter += 1
-        else:
-            last_annotated = last_annotated if last_annotated is not None else frame
+
+        # On skipped frames, reuse last annotated
+        display_frame = last_annotated if last_annotated is not None else frame
 
         # FPS display
         if time.time() - fps_timer >= 1.0:
@@ -265,19 +315,21 @@ def main():
             fps_counter = 0
             fps_timer = time.time()
 
-        display_frame = last_annotated if last_annotated is not None else frame
         if SHOW_FPS:
-            cv2.putText(display_frame, f"FPS: {fps_display}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+            display_copy = display_frame.copy()
+            fps_label = f"FPS: {fps_display}"
+            (fw, fh), baseline = cv2.getTextSize(fps_label, font, 0.9, 2)
+            cv2.rectangle(display_copy, (5, 5), (5+fw+5, 5+fh+5), (0,0,0), -1)
+            cv2.putText(display_copy, fps_label, (10, 10+fh), font, 0.9, (0,255,0), 2)
+            display_frame = display_copy
 
         small_display = cv2.resize(display_frame, (960, 540))
-        cv2.imshow("PPE Detection + Deep Analysis", small_display)
+        cv2.imshow("PPE Detection", small_display)
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
     cap.release()
     cv2.destroyAllWindows()
-    if vlm:
-        vlm.shutdown()
 
 if __name__ == "__main__":
     main()

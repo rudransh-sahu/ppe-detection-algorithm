@@ -9,6 +9,14 @@ import os
 from PIL import Image
 from transformers import AutoProcessor, AutoModelForImageTextToText
 
+# Optional: use json5 for better parsing (install: pip install json5)
+try:
+    import json5
+    USE_JSON5 = True
+except ImportError:
+    USE_JSON5 = False
+    print("[VLM] json5 not installed, using fallback repair method.")
+
 class AsyncVlmAnalyzer:
     def __init__(self, model_id="HuggingFaceTB/SmolVLM2-256M-Instruct", device="cpu", max_queue_size=1):
         print(f"[VLM] Loading model {model_id}...")
@@ -19,7 +27,6 @@ class AsyncVlmAnalyzer:
         self.model.eval()
         print("[VLM] Model loaded successfully.")
 
-        # Only one pending task at a time
         self.task_queue = queue.Queue(maxsize=max_queue_size)
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._worker, daemon=True)
@@ -28,16 +35,30 @@ class AsyncVlmAnalyzer:
 
     @staticmethod
     def repair_json(text):
+        """Safer repair: use json5 if available, else manual regex."""
+        if USE_JSON5:
+            try:
+                return json5.loads(text)
+            except Exception:
+                pass
+        # Manual fallback: extract content between first { and last }
         match = re.search(r'\{.*\}', text, re.DOTALL)
         if not match:
             return None
         json_str = match.group(0)
-        json_str = json_str.replace("'", '"')
+        # Replace single quotes only when they are likely key/value delimiters
+        # This avoids breaking apostrophes inside strings
+        json_str = re.sub(r"(?<=[{, ])'|'(?=[:}])", '"', json_str)
+        # Replace bare boolean literals
         json_str = re.sub(r':\s*true\b', ': true', json_str, flags=re.IGNORECASE)
         json_str = re.sub(r':\s*false\b', ': false', json_str, flags=re.IGNORECASE)
         json_str = re.sub(r':\s*bool\b', ': false', json_str, flags=re.IGNORECASE)
+        # Remove trailing commas
         json_str = re.sub(r',\s*}', '}', json_str)
-        return json_str
+        try:
+            return json.loads(json_str)
+        except:
+            return None
 
     def _worker(self):
         print("[VLM Worker] Thread alive.")
@@ -61,11 +82,10 @@ class AsyncVlmAnalyzer:
                 inputs = self.processor(text=text, images=image, return_tensors="pt").to(self.device)
 
                 with torch.no_grad():
-                    # Fast generation – only 30 tokens
-                    outputs = self.model.generate(**inputs, max_new_tokens=30)
+                    # CRITICAL: increased max_new_tokens to 80
+                    outputs = self.model.generate(**inputs, max_new_tokens=80)
                 full_response = self.processor.decode(outputs[0], skip_special_tokens=True)
 
-                # Extract assistant's reply
                 assistant_part = full_response
                 if "Assistant:" in full_response:
                     assistant_part = full_response.split("Assistant:")[-1].strip()
@@ -81,16 +101,14 @@ class AsyncVlmAnalyzer:
                 except Exception:
                     repaired = self.repair_json(assistant_part)
                     if repaired:
-                        try:
-                            result = json.loads(repaired)
-                        except Exception:
-                            result = {"error": "parse_failed", "raw": assistant_part}
+                        result = repaired
                     else:
-                        result = {"error": "no_json", "raw": assistant_part}
+                        # Truncate raw response to avoid log bloat
+                        raw_short = (assistant_part[:200] + '...') if len(assistant_part) > 200 else assistant_part
+                        result = {"error": "parse_failed", "raw": raw_short}
 
                 print(f"\n[VLM RESULT] Worker {worker_id}: {result}\n")
 
-                # Save result to JSONL file
                 log_entry = {
                     "timestamp": time.time(),
                     "worker_id": worker_id,
@@ -116,18 +134,17 @@ class AsyncVlmAnalyzer:
             except Exception as e:
                 print(f"[VLM Worker] ERROR: {type(e).__name__}: {e}")
                 traceback.print_exc()
+                # Attempt to delete snapshot even on error
+                try:
+                    if 'img_path' in locals() and os.path.exists(img_path):
+                        os.remove(img_path)
+                        print(f"[VLM Worker] Deleted snapshot after error: {img_path}")
+                except:
+                    pass
         print("[VLM Worker] Exiting.")
 
     def analyze_async(self, image_path, worker_id, prompt=None):
-        if self.task_queue.full():
-            print(f"[VLM] Queue full, dropping worker {worker_id}")
-            # Delete orphaned snapshot immediately
-            try:
-                os.remove(image_path)
-            except:
-                pass
-            return
-
+        # Fix TOCTOU race: use put_nowait
         if prompt is None:
             prompt = (
                 "You are a strict JSON output generator. Analyze the worker in this image. "
@@ -135,11 +152,23 @@ class AsyncVlmAnalyzer:
                 "Use double quotes. Keys: helmet_type, vest_color, reflective_stripes, overall_compliance. "
                 'Example: {"helmet_type": "safety", "vest_color": "green", "reflective_stripes": true, "overall_compliance": true}'
             )
-        print(f"[VLM] Queueing worker {worker_id}")
-        self.task_queue.put((image_path, worker_id, prompt))
+        try:
+            self.task_queue.put_nowait((image_path, worker_id, prompt))
+            print(f"[VLM] Queued worker {worker_id}")
+        except queue.Full:
+            print(f"[VLM] Queue full, dropping worker {worker_id}")
+            try:
+                os.remove(image_path)
+                print(f"[VLM] Deleted orphaned snapshot: {image_path}")
+            except:
+                pass
 
     def shutdown(self):
         print("[VLM] Shutting down...")
         self._stop.set()
-        self._thread.join(timeout=2)
-        print("[VLM] Shutdown complete.")
+        # Increase timeout to allow current inference to finish (30s typical)
+        self._thread.join(timeout=30)
+        if self._thread.is_alive():
+            print("[VLM] Worker did not finish within 30s, forcing exit.")
+        else:
+            print("[VLM] Shutdown complete.")
